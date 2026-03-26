@@ -1,0 +1,131 @@
+---
+title: "SAL 300 Assignment 2"
+author: "Evan Friedman"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+library(tidyverse)
+library(ggplot2)
+library(scales)
+data <- read_csv("nba_archtics_export.csv")
+
+```
+
+```{r}
+#get # of each plan sold by season including the total # of plans sold
+by_season_plan <- data %>% group_by(Season, Plan_Type) %>% summarize(plans_sold = n())
+
+#Creates bar chart showing distribution of plan by season
+
+plan_type_plot <- ggplot(by_season_plan, aes(fill = Plan_Type, y = plans_sold, x = Season)) +
+  geom_bar(stat = "identity") + labs(y = "# of Plans Sold", fill = "Type of Plan") + geom_text()
+ggsave("ticket_plan_type_plot.png")
+
+
+
+#Find distribution of plans sold by who was the Lead Source
+referral <- data %>% group_by(Lead_Source) %>% summarize(total_sold = n()) #
+
+#pie chart
+
+referral_chart <- ggplot(referral, aes(x = "", y = total_sold, fill = Lead_Source)) +
+  geom_bar(width = 1, stat = "identity") +
+  coord_polar("y", start = 0) +
+  geom_text(aes(label = percent(total_sold/sum(total_sold))),
+            position = position_stack(vjust = 0.5), size = 5) +
+  labs(fill = "Lead Source", y = "", x = "", title = "Plans Sold by Referral Source")
+
+print(referral_chart)
+ggsave("referral_chart.png")
+
+
+#Find distribution of plans sold by who the Account Holder was
+acc_holder <- data %>% group_by(Account_Holder_Type) %>% summarize(total_sold = n()) #pie chart
+
+#pie chart
+
+acc_type_chart <- ggplot(acc_holder, aes(x = "", y = total_sold, fill = Account_Holder_Type)) +
+  geom_bar(width = 1, stat = "identity") +
+  coord_polar("y", start = 0) +
+  geom_text(aes(label = percent(total_sold/sum(total_sold))),
+            position = position_stack(vjust = 0.5), size = 5) +
+  labs(fill = "Account Holder", y = "", x = "", title = "Plans Sold by Account Type")
+
+print(acc_type_chart)
+ggsave("acc_type_chart.png")
+
+```
+
+```{r}
+#Breaks down sales by section and subsection, takes average price of ticket and # of plans sold to get an total sales by section on average
+
+section <- data %>% group_by(Section, Subsection) %>% summarize(price = mean(Avg_Price), sold = n()) %>% mutate(total_sales = price * sold)
+
+#looks at only courtside sections, returns 5 highest grossing sections on average
+
+floor_level <- data %>% filter(Arena_Level == "Courtside") %>% group_by(Section, Subsection) %>% summarize(price = mean(Avg_Price), sold = n()) %>% mutate(total_sales = price * sold) %>% arrange(desc(total_sales)) %>% head(5)
+
+#looks at only sections in the lower bowl, returns 5 highest grossing sections on average
+
+lower_bowl <- data %>% filter(Arena_Level == "Lower Bowl") %>% group_by(Section, Subsection) %>% summarize(price = mean(Avg_Price), sold = n()) %>% mutate(total_sales = price * sold) %>% arrange(desc(total_sales)) %>% head(5)
+
+#Looks at only sections in the upper bowl, returns 5 highest grossing sections on average
+
+upper_bowl <- data %>% filter(Arena_Level == "Upper Bowl") %>% group_by(Section, Subsection) %>% summarize(price = mean(Avg_Price), sold = n()) %>% mutate(total_sales = price * sold) %>% arrange(desc(total_sales)) %>% head(5)
+
+```
+
+```{r}
+#Adds to original df the %'s of how each buyer uses their tickets. Looking to examine breakdown of games that the buyer attends, resells, etc. 
+
+game_att <- data %>% mutate(perc_attended = round((Games_Attended / (Games_Attended + Games_Resold + Games_Forwarded + Games_Unused) * 100), 2), perc_unused = round((Games_Unused / (Games_Attended + Games_Resold + Games_Forwarded + Games_Unused) * 100), 2), perc_resold = round((Games_Resold / (Games_Attended + Games_Resold + Games_Forwarded + Games_Unused) * 100), 2), perc_forwarded = round((Games_Forwarded / (Games_Attended + Games_Resold + Games_Forwarded + Games_Unused) * 100), 2))
+
+#Grouped by how long the ticket holder has owned tickets. Takes an average for each year tenured
+game_action_by_years <- game_att %>% group_by(Tenure_Years) %>% summarize(avg_games_att = mean(perc_attended), avg_games_unused = mean(perc_unused), avg_games_resold = mean(perc_resold), avg_games_forwarded = mean(perc_forwarded))
+
+#Creates line chart that examines the % of each ticket action and if it changes as tenure increases
+
+game_action_by_years_plot <- ggplot(test, aes(x = Tenure_Years)) + 
+  geom_line(aes(y = avg_games_att, color = "Games Attended")) +
+  geom_line(aes(y = avg_games_unused, color = "Games Unused")) +
+  geom_line(aes(y = avg_games_resold, color = "Games Resold")) +
+  geom_line(aes(y = avg_games_forwarded, color = "Games Forwarded")) + 
+  labs(x = "Years Tenured", y = "% of Games", color = "Ticket Action", title = "Ticket Usage by Years Tenured (On Average)") + theme_bw()
+ggsave("game_action_by_year.png")
+
+
+#Rather than taking %, uses total number of each action grouped by who the tickets are being bought by
+
+game_action_by_acc_type <- game_att %>% group_by(Account_Holder_Type) %>% summarize(avg_games_att = sum(Games_Attended), avg_games_unused = sum(Games_Unused), avg_games_resold = sum(Games_Resold), avg_games_forwarded = sum(Games_Forwarded))
+
+#Creating pivot chart to set up for 100% stacked bar chart. Change names for convenience
+df <- game_action_by_acc_type %>%
+  pivot_longer(cols = starts_with("avg_games"),
+               names_to = "usage_type",
+               values_to = "value")
+df <- df %>%
+  mutate(usage_type = recode(usage_type,
+    "avg_games_att" = "Games Attended",
+    "avg_games_unused" = "Games Unused",
+    "avg_games_resold" = "Games Resold",
+    "avg_games_forwarded" = "Games Forwarded"
+  ))
+
+#100% stacked bar chart, demonstrates that fan behavior stays consistent regardless of who is purchasing
+
+ggplot(df, aes(x = Account_Holder_Type, y = value, fill = usage_type)) +
+  geom_bar(stat = "identity", position = "fill") +
+  scale_y_continuous(labels = scales::percent) +
+  labs(x = "Account Type", y = "Percentage", fill = "Ticket Action")
+
+ggsave("game_action_by_acc_type_plot.png")
+
+
+```
+
