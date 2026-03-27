@@ -1,0 +1,248 @@
+---
+title: "assignment_6"
+author: "Evan Friedman"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+library(dplyr)
+library(ggplot2)
+library(caret)
+library(MASS)
+library(randomForest)
+library(pROC)
+library(car)
+library(tidyr)
+library(forcats)
+
+set.seed(242)
+
+final_dataset <- read.csv("Example_Boston_Celtics_Retention_Model_Dataset.csv")
+
+summary(final_dataset)
+```
+
+```{r}
+#feature engineering
+
+final_dataset <- final_dataset %>% mutate(tenure_buckets = case_when(
+  tenure <= 3 ~ "New Fan",
+  tenure >= 4 & tenure <= 7 ~ "Pro Fan",
+  TRUE        ~ "Veteran Fan" 
+))
+
+final_dataset <- final_dataset %>% mutate(
+  attendance_rate = games_attended/41,
+   forward_rate = ifelse(
+      (games_attended + games_resold + games_forwarded) > 0,
+      games_forwarded / (games_attended + games_resold + games_forwarded),
+      0
+    ),
+   resell_rate = ifelse(
+      (games_attended + games_resold + games_forwarded) > 0,
+      games_resold / (games_attended + games_resold + games_forwarded),
+      0
+    ),
+   engagement_index = scale(
+      digital_engagement_score + email_clicks + app_visits
+    )[,1],
+  arena_level = factor(arena_level,
+                         levels = c("Upper Bowl","Lower Bowl","Courtside")),
+  loyalty_program = factor(loyalty_program),
+  auto_renew = factor(auto_renew),
+  service_rep = factor(service_rep),
+  member_events = factor(member_events_attended,
+                       levels = c("3", "2", "1", "0")),
+  member_events = fct_collapse(member_events,
+                       "2+" = c("3", "2")),
+  high_demand_game_rate = high_demand_games_attended/games_attended,
+  average_cost_per_game = (seat_count * avg_ticket_price + merch_spend)*41,
+  tenure = replace_na(tenure, 0),
+  tenure_buckets = factor(tenure_buckets,
+                          levels = c("New Fan", "Pro Fan", "Veteran Fan"))
+  )
+```
+
+```{r}
+final_dataset <- final_dataset %>% mutate(
+  season_start = as.numeric(substr(season, 1, 4))) %>% 
+    arrange(fan_id, season_start) %>% 
+    group_by(fan_id) %>% 
+    mutate(
+    next_season = lead(season_start),
+    renewed_flag = case_when(
+      # Normal consecutive renewal
+      next_season == season_start + 1 ~ 1,
+      
+      # Special COVID skip: 2019-20 → 2021-22
+      season_start == 2019 & next_season == 2021 ~ 1,
+      
+      TRUE ~ 0
+    )
+  ) %>%
+  ungroup()
+
+
+final_dataset$renewed_flag <- factor(
+  ifelse(final_dataset$renewed_flag == 1, "Yes", "No"),
+  levels = c("No","Yes")
+)
+
+```
+
+```{r}
+train_index <- createDataPartition(
+  final_dataset$renewed_flag,
+  p = 0.8,
+  list = FALSE
+)
+
+train_data <- final_dataset[train_index, ]
+test_data  <- final_dataset[-train_index, ]
+
+```
+
+
+```{r}
+full_model <- glm(
+  renewed_flag ~ attendance_rate +
+    resell_rate +
+    win_pct + 
+    arena_level +
+    high_demand_game_rate +
+    engagement_index +
+    tenure_buckets +
+    average_cost_per_game,
+  data = train_data,
+  family = binomial()
+)
+
+step_model <- stepAIC(full_model, direction = "both", trace = FALSE)
+
+summary(full_model)
+summary(step_model)
+```
+
+```{r}
+coefs <- summary(step_model)$coefficients
+coefs_df <- as.data.frame(coefs)
+coefs_df$feature <- rownames(coefs_df)
+
+coefs_df <- coefs_df %>%
+  filter(feature != "(Intercept)") %>%
+  mutate(
+    odds_ratio = exp(Estimate),
+    lower_ci = exp(Estimate - 1.96 * `Std. Error`),
+    upper_ci = exp(Estimate + 1.96 * `Std. Error`)
+  )
+
+print(coefs_df)
+```
+
+```{r}
+logit_probs <- predict(step_model, newdata = test_data, type = "response")
+logit_class <- ifelse(logit_probs > 0.5, "Yes", "No")
+
+confusionMatrix(
+  factor(logit_class, levels = c("No","Yes")),
+  test_data$renewed_flag
+)
+
+roc_obj <- roc(
+  test_data$renewed_flag,
+  logit_probs,
+  levels = c("No","Yes")
+)
+
+plot(roc_obj, main = "ROC Curve - Logistic Regression")
+print(auc(roc_obj))
+
+```
+
+
+
+```{r}
+rf_model <- randomForest(
+  renewed_flag ~ attendance_rate +
+    resell_rate +
+    win_pct + 
+    high_demand_game_rate +
+    member_events + 
+    tenure_buckets +
+    arena_level +
+    average_cost_per_game,
+  data = train_data,
+  ntree = 300,
+  importance = TRUE
+)
+
+rf_preds <- predict(rf_model, newdata = test_data)
+
+confusionMatrix(rf_preds, test_data$renewed_flag)
+
+varImpPlot(rf_model)
+```
+
+```{r}
+train_control <- trainControl(
+  method = "cv",
+  number = 5,
+  classProbs = TRUE,
+  summaryFunction = twoClassSummary
+)
+
+
+cv_rf <- train(
+  renewed_flag ~ attendance_rate +
+    resell_rate +
+    win_pct + 
+    high_demand_games_attended +
+    member_events + 
+    tenure_buckets +
+    arena_level +
+    average_cost_per_game,
+  data = final_dataset,
+  method = "rf",
+  trControl = train_control,
+  metric = "ROC",
+  tuneLength = 5
+)
+
+print(cv_rf)
+```
+
+```{r}
+cv_logit <- train(
+  renewed_flag ~ attendance_rate +
+    resell_rate +
+    win_pct + 
+    high_demand_games_attended +
+    member_events + 
+    tenure_buckets +
+    arena_level +
+    average_cost_per_game,
+  data = final_dataset,
+  method = "glm",
+  family = "binomial",
+  trControl = train_control,
+  metric = "ROC",
+)
+
+print(cv_logit)
+```
+
+```{r}
+resamples_list <- resamples(list(
+  Logistic = cv_logit,
+  RandomForest = cv_rf
+))
+
+summary(resamples_list)
+bwplot(resamples_list, metric = "ROC")
+```
+

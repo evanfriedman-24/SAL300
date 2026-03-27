@@ -1,0 +1,470 @@
+---
+title: "Assignment 3"
+author: "Evan Friedman"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+library(tidyr)
+library(dplyr)
+library(readxl)
+library(readr)
+library(stringr)
+library(ggplot2)
+library(magrittr)
+library(lubridate)
+library(rvest)
+```
+
+```{r}
+#load in training data, clean column names
+training_data <- read_csv("Historical Schedule.csv")
+
+training_data <- training_data %>% rename("Home_Team_Abbreviation" = "Home Team Abbreviation", "Opponent_Team_Abbreviation" = "Opponent Team Abbreviation", "Game_Date" = "Game Date")
+
+```
+
+```{r}
+#looks at the top 5 games in terms of ticket revenue in each season
+top_5_games = training_data %>% group_by(Season) %>% 
+  arrange(-Gate_Receipts) %>% slice(1:5) %>%
+  ungroup()
+
+#Demonstrated dominance from games hosting the Lakers, Warriors, and Celtics
+table(top_5_games$Opponent_Team_Abbreviation)
+
+
+training_data$marquee_opp <- ifelse(training_data$Opponent_Team_Abbreviation %in% c("LAL", "GSW", "BOS"), 1,0)
+
+#clear difference when one of these 3 teams come to town
+ggplot(training_data, aes(x = Season, y = Gate_Receipts, color = factor(marquee_opp))) + 
+  geom_point() + labs(title = "Distribution of Game Recipts by Season", y = "Gate Recipts") + scale_color_manual(values = c("0" = "steelblue", "1" = "gold"),
+                    name = "LAL, GSW, or BOS",
+                    labels = c("No", "Yes"))
+```
+
+
+```{r}
+#Creating model features on training data
+
+#uses game date column to get month and day of week
+training_data$Date <- as.Date(training_data$Game_Date, format = "%m/%d/%Y")
+
+training_data$Month = months(training_data$Date)
+
+training_data$Weekday = weekdays(training_data$Date)
+
+#creating days since last game variable
+training_data %<>% arrange(Date) %>% 
+  group_by(Home_Team_Abbreviation,Season) %>% mutate(DaysSinceLastGame = as.numeric(Date - lag(Date))) %>% ungroup()
+
+#detects whether or not the Hawks already played this team earlier in the season
+training_data <- training_data %>%
+  group_by(Season, Opponent_Team_Abbreviation) %>%
+  mutate(Matchup_Num = row_number()) %>%
+  ungroup()
+
+
+#setting up dummy variables for model
+#post road trip means if there is at least a 6 day gap between home games
+training_data$HomeOpener = ifelse(is.na(training_data$DaysSinceLastGame),1,0)
+training_data$DaysSinceLastGame[is.na(training_data$DaysSinceLastGame)] = 0
+training_data$b2b = ifelse(training_data$DaysSinceLastGame == 1, 1, 0)
+training_data$PostRoadTrip = ifelse(training_data$DaysSinceLastGame >= 6, 1, 0)
+training_data$AlreadyPlayed = ifelse(training_data$Matchup_Num > 1, 1, 0)
+
+training_data$Oct.Nov = ifelse(training_data$Month %in% c('October','November') ,1,0)
+training_data$Mar.Apr = ifelse(training_data$Month %in% c('March','April'),1,0)
+training_data$Dec.Jan = ifelse(training_data$Month %in% c('December', 'January'),1,0)
+training_data$Feb = ifelse(training_data$Month %in% c('February'),1,0)
+
+training_data$Mon = ifelse(training_data$Weekday %in% c('Monday'),1,0)
+training_data$Tues = ifelse(training_data$Weekday %in% c('Tuesday'),1,0)
+training_data$Weds = ifelse(training_data$Weekday %in% c('Wednesday'),1,0)
+training_data$Thurs = ifelse(training_data$Weekday %in% c('Thursday'),1,0)
+training_data$Fri = ifelse(training_data$Weekday %in% c('Friday'),1,0)
+training_data$Sat = ifelse(training_data$Weekday %in% c('Saturday'),1,0)
+training_data$Sun = ifelse(training_data$Weekday %in% c('Sunday'),1,0)
+
+#as aforementioned, big gap in the data for games featuring the Lakers, Warriors, and Celtics
+training_data$Lebron_Effect = ifelse(training_data$Opponent_Team_Abbreviation == 'LAL',1,0)
+
+training_data$Curry_Effect = 
+ifelse(training_data$Opponent_Team_Abbreviation == 'GSW',1,0)
+
+training_data$Bos_Effect = 
+ifelse(training_data$Opponent_Team_Abbreviation == 'BOS',1,0)
+
+
+```
+
+
+```{r}
+#Scraping in team standings data from basketball reference to detect if a team made the playoffs in the previous year.
+
+years <- 2019:2025
+all_standings <- list()
+
+for (year in years) {
+  url <- paste0("https://www.basketball-reference.com/leagues/NBA_", year, "_standings.html")
+
+  page <- read_html(url)
+  
+  east <- page %>%
+    html_element("#confs_standings_E") %>%
+    html_table()
+  east$Conference <- "Eastern"
+  east$Season <- paste0(year)
+
+  west <- page %>%
+    html_element("#confs_standings_W") %>%
+    html_table()
+  west$Conference <- "Western"
+  west$Season <- paste0(year)
+  all_standings[[as.character(year)]] <- bind_rows(east, west)
+  Sys.sleep(2)
+  
+  print(paste("Scraped", year))
+}
+
+nba_standings <- bind_rows(all_standings)
+
+#cleaning scraped data, making new variables to easily join over
+nba_standings$Playoff <- ifelse(str_detect(nba_standings$`Eastern Conference`, "\\*") | str_detect(nba_standings$`Western Conference`, "\\*"), 1, 0)
+nba_standings$Playoff <- ifelse(is.na(nba_standings$Playoff), 0, 1)
+
+
+nba_standings$Team <- coalesce(nba_standings$`Eastern Conference`, nba_standings$`Western Conference`)
+nba_standings$Team <- str_remove(nba_standings$Team, "\\*")
+nba_standings$Team <- str_trim(nba_standings$Team)
+
+#team abbreviation alias to assign team names from BBRef to abbreviated names in schedule data
+team_abbrev <- c(
+  "Atlanta Hawks" = "ATL",
+  "Boston Celtics" = "BOS",
+  "Brooklyn Nets" = "BRK",
+  "Charlotte Hornets" = "CHA",
+  "Chicago Bulls" = "CHI",
+  "Cleveland Cavaliers" = "CLE",
+  "Dallas Mavericks" = "DAL",
+  "Denver Nuggets" = "DEN",
+  "Detroit Pistons" = "DET",
+  "Golden State Warriors" = "GSW",
+  "Houston Rockets" = "HOU",
+  "Indiana Pacers" = "IND",
+  "Los Angeles Clippers" = "LAC",
+  "Los Angeles Lakers" = "LAL",
+  "Memphis Grizzlies" = "MEM",
+  "Miami Heat" = "MIA",
+  "Milwaukee Bucks" = "MIL",
+  "Minnesota Timberwolves" = "MIN",
+  "New Orleans Pelicans" = "NOP",
+  "New York Knicks" = "NYK",
+  "Oklahoma City Thunder" = "OKC",
+  "Orlando Magic" = "ORL",
+  "Philadelphia 76ers" = "PHI",
+  "Phoenix Suns" = "PHX",
+  "Portland Trail Blazers" = "POR",
+  "Sacramento Kings" = "SAC",
+  "San Antonio Spurs" = "SAS",
+  "Toronto Raptors" = "TOR",
+  "Utah Jazz" = "UTA",
+  "Washington Wizards" = "WAS"
+)
+
+nba_standings$Team <- team_abbrev[nba_standings$Team]
+
+nba_standings$Season <- as.numeric(nba_standings$Season)
+
+nba_standings <- nba_standings %>%
+  select(Team, Season, Playoff, Conference) %>%
+  mutate(NextSeason = Season + 1) %>%
+  rename(PlayoffLastSeason = Playoff)
+
+
+```
+
+```{r}
+#joining the standings data to the training data
+training_data <- training_data %>%
+  left_join(nba_standings, by = c("Season" = "NextSeason", "Opponent_Team_Abbreviation" = "Team"))
+
+#able to now consider inter/outer conference play
+training_data$OutOfConf <- ifelse(training_data$Conference == "Western", 1, 0)
+
+
+#created excel of players who made All-NBA first team from 2020-2025 seasons. Looking to identify if star power from top 5 players have affect on sales
+all_nba <- read_excel("all_nba_teams.xlsx")
+
+#joining all NBA data over to training data, cleaning table to prepare for model
+training_data <- training_data %>% 
+  left_join(all_nba, by = c("Season" = "NextSeason",
+                            "Opponent_Team_Abbreviation" = "Team"))
+
+training_data <- training_data %>% select(-Season.y, -Season.y.y)
+
+training_data$AllNBAPlayer <- ifelse(is.na(training_data$Player), 0, 1)
+
+
+                                                         
+```
+
+```{r}
+#creating formula to begin modelling
+#left out February for months and Sunday for day of week to avoid multicollinearity
+formula_use = Gate_Receipts ~
+  Oct.Nov +
+  Dec.Jan + 
+  Mar.Apr + 
+  Mon + 
+  Tues + 
+  Weds +
+  Thurs +
+  Fri + 
+  Sat +
+  DaysSinceLastGame +
+  HomeOpener +
+  Lebron_Effect +
+  Curry_Effect +
+  Bos_Effect +
+  b2b + 
+  PostRoadTrip + 
+  AlreadyPlayed + 
+  PlayoffLastSeason + 
+  OutOfConf + 
+  AllNBAPlayer
+
+#separate my data into training and test. Using first four seasons as training and fifth season as test
+train = training_data %>% filter(Season %in% c('2021','2022','2023','2024'))
+test = training_data %>% filter(Season %in% c('2025'))
+
+model_2025 = lm(formula = formula_use,
+                data = train)
+
+summary(model_2025)
+
+#As expected, the model picked up significance in the marquee matchups of the Lakers, Warriors, and Celtics. The model also picked up significance on Friday and Saturday games, as well as small significance for later games in the season. While not statistically significant, one variable that was close was the playoff variable, actually having a very slight negative estimate. Could be based on other significant factors, but maybe fans are incentivized to see a win rather than a tougher opponent? Could also be weird due to increased parity in the league, even though 66% of teams that make the playoffs made it the year before. 
+```
+
+```{r}
+#now using test data to see if our predictions are close
+pred_2025 = predict(model_2025, newdata = test)
+
+#looking at residuals to see if we're far off on our predictions, more games are being slighly undervalued than overvalued
+test_results = test %>%
+  mutate(
+    pred = pred_2025,
+    residual = Gate_Receipts - pred
+  )
+
+#checking rmse and mae for model accuracy
+rmse = sqrt(mean(test_results$residual^2))
+mae  = mean(abs(test_results$residual))
+
+rmse
+mae
+
+mean_actual <- mean(test$Gate_Receipts)
+
+mae_pct  <- mae / mean_actual
+rmse_pct <- rmse / mean_actual
+
+```
+
+
+```{r}
+#Now, it's time to load in the schedule data for this upcoming season. Need to clean data and recreate all my variables to match my training dataset
+schedule <- read_csv("2025-26 Schedule.csv")
+schedule$Season <- 2025
+
+schedule <- schedule %>% rename("Opponent_Team_Abbreviation" = "Away_Team", "Game_Date" = "Date")
+
+schedule$Opponent_Team_Abbreviation[schedule$Opponent_Team_Abbreviation == "BKN"] <- "BRK"
+
+schedule$Date <- as.Date(schedule$Game_Date, format = "%m/%d/%Y")
+
+schedule$Month = months(schedule$Date)
+
+schedule$Weekday = weekdays(schedule$Date)
+
+schedule %<>% arrange(Date) %>% 
+  group_by(Home_Team) %>% mutate(DaysSinceLastGame = as.numeric(Date - lag(Date))) %>% ungroup()
+
+schedule <- schedule %>%
+  group_by(Opponent_Team_Abbreviation) %>%
+  mutate(Matchup_Num = row_number()) %>%
+  ungroup()
+
+schedule$HomeOpener = ifelse(is.na(schedule$DaysSinceLastGame),1,0)
+schedule$DaysSinceLastGame[is.na(schedule$DaysSinceLastGame)] = 0
+schedule$b2b = ifelse(schedule$DaysSinceLastGame == 1, 1, 0)
+schedule$PostRoadTrip = ifelse(schedule$DaysSinceLastGame >= 6, 1, 0)
+
+schedule$Oct.Nov = ifelse(schedule$Month %in% c('October','November') ,1,0)
+schedule$Mar.Apr = ifelse(schedule$Month %in% c('March','April'),1,0)
+schedule$Dec.Jan = ifelse(schedule$Month %in% c('December', 'January'),1,0)
+schedule$Feb = ifelse(schedule$Month %in% c('February'),1,0)
+
+schedule$Mon = ifelse(schedule$Weekday %in% c('Monday'),1,0)
+schedule$Tues = ifelse(schedule$Weekday %in% c('Tuesday'),1,0)
+schedule$Weds = ifelse(schedule$Weekday %in% c('Wednesday'),1,0)
+schedule$Thurs = ifelse(schedule$Weekday %in% c('Thursday'),1,0)
+schedule$Fri = ifelse(schedule$Weekday %in% c('Friday'),1,0)
+schedule$Sat = ifelse(schedule$Weekday %in% c('Saturday'),1,0)
+schedule$Sun = ifelse(schedule$Weekday %in% c('Sunday'),1,0)
+
+schedule$Lebron_Effect = ifelse(schedule$Opponent_Team_Abbreviation == 'LAL',1,0)
+
+schedule$Curry_Effect = 
+ifelse(schedule$Opponent_Team_Abbreviation == 'GSW',1,0)
+
+schedule$Bos_Effect = 
+ifelse(schedule$Opponent_Team_Abbreviation == 'BOS',1,0)
+
+schedule$AlreadyPlayed = ifelse(schedule$Matchup_Num >= 2, 1, 0)
+
+schedule <- schedule %>% 
+  left_join(all_nba, by = c("Season" = "NextSeason",
+                            "Opponent_Team_Abbreviation" = "Team"))
+
+schedule <- schedule %>%
+  left_join(nba_standings, by = c("Season" = "NextSeason", "Opponent_Team_Abbreviation" = "Team"))
+
+schedule$OutOfConf <- ifelse(schedule$Conference == "Western", 1, 0)
+
+schedule$AllNBAPlayer <- ifelse(is.na(schedule$Player), 0, 1)
+
+schedule <- schedule %>% select(-Season.y, -Season.y.y)
+
+```
+
+```{r}
+#using my model from the testing stage to predict values for this season
+pred_2026 = predict(model_2025, newdata = schedule)
+
+test_results_2026 = schedule %>%
+  mutate(
+    pred = pred_2026)
+
+#Creating game score based on example shared in class. Reverse enginnered creating of game revenue in example to create Game Score that can rank each game
+avg_gate <- mean(test_results_2026$pred)
+
+test_results_2026 <- test_results_2026 %>%
+  mutate(Game_Score = ((pred / avg_gate) - 1) / 0.35)
+
+final <- test_results_2026 %>% select(Game_Date, Home_Team, Opponent_Team_Abbreviation, pred, Game_Score) %>% arrange(-Game_Score) %>% mutate(Rank = row_number())
+
+#csv with each game ranked 1-40, along with the predicted revenue labeled as pred
+write.csv(final, "game_rank.csv", row.names = F)
+```
+
+```{r}
+#exploring the breakdown based off our model for the new season
+
+games <- read_csv("game_rank.csv")
+
+#we can see with this plot that the games against the Warriors, Celtics and especially the Lakers, are in a league of its own.
+ggplot(games, aes(x = pred)) +
+  geom_histogram(bins = 20)+
+  labs(title = "Distribution of Predicted Revenue", x = "Predicted Gate Revenue", y = "")
+
+#variation in every other game is very hard to see, so I want to remove those top 4 games and look at the distribution of the remaining 36
+games_not_top_4 <- games %>% arrange(-pred) %>% slice(5:40)
+
+ggplot(games_not_top_4, aes(x = pred)) +
+  geom_histogram(bins = 20)+
+  labs(title = "Distribution of Predicted Revenue", x = "Predicted Gate Revenue", y = "")
+
+```
+
+```{r}
+#To create game tiers, I decided to use clustering based on the game score and predicted revenue. This should be a linear relationship, but I am more focused on how the games are separated from each other.
+cluster_data = games %>%
+  select(Game_Score, pred)
+
+cluster_scaled = scale(cluster_data)
+
+set.seed(42)
+#Decided to use 6 clusters. After examination and testing, I believe the Lakers game belongs in it's own tier. This is then led by the next 3 creating their own tier. the next games would be split up into 4 distinct groups.
+k_fit <- kmeans(cluster_scaled, centers = 6, nstart = 25)
+
+games$cluster <- factor(k_fit$cluster)
+
+#tier cluster and names created
+games <- games %>%
+  mutate(tier_cluster = case_when(
+      cluster == 1 ~ "LakeShow",
+      cluster == 2 ~ "Diamond",
+      cluster == 3 ~ "Silver",
+      cluster == 4 ~ "Bronze",
+      cluster == 5 ~ "Gold",
+      cluster == 6 ~ "Platinum"))
+
+#plot of these tiers. Once again, the top 4 are making the rest of the games hard to decipher.
+ggplot(games, aes(x = Game_Score, y = pred,
+                  color = tier_cluster)) +
+  geom_point(size = 2) +
+  labs(title = "Game Clusters Based on Score & Revenue") + scale_color_manual(values = c(
+    "LakeShow" = "#552583",   # Lakers purple
+    "Diamond" = "#B9F2FF",     # Light blue diamond
+    "Platinum" = "#E5E4E2",    # Platinum silver
+    "Gold" = "#FFD700",        # Gold
+    "Silver" = "#C0C0C0",      # Silver
+    "Bronze" = "#CD7F32"       # Bronze
+  ),
+  name = "Tier"
+) + theme_dark()
+
+games$Avg_Price = games$pred / 16500
+```
+
+```{r}
+#doing same process but with the exclusion of tiers 1 and 2
+cluster_data = games_not_top_4 %>%
+  select(Game_Score, pred)
+
+cluster_scaled = scale(cluster_data)
+
+set.seed(42)
+
+k_fit <- kmeans(cluster_scaled, centers = 4, nstart = 25)
+
+games_not_top_4$cluster <- factor(k_fit$cluster)
+
+games_not_top_4 <- games_not_top_4 %>%
+  mutate(tier_cluster = case_when(
+      cluster == 1 ~ "Silver",
+      cluster == 2 ~ "Platinum",
+      cluster == 3 ~ "Bronze",
+      cluster == 4 ~ "Gold"))
+
+ggplot(games_not_top_4, aes(x = Game_Score, y = pred,
+                  color = tier_cluster)) +
+  geom_point(size = 2) +
+  labs(title = "Game Clusters Based on Score & Revenue") + scale_color_manual(values = c("Platinum" = "#E5E4E2",    # Platinum silver
+    "Gold" = "#FFD700",        # Gold
+    "Silver" = "#C0C0C0",      # Silver
+    "Bronze" = "#CD7F32"       # Bronze
+  ),
+  name = "Tier"
+) + theme_dark()
+
+games_not_top_4$Avg_Price = games_not_top_4$pred / 16500
+```
+
+```{r}
+#Creates average price of ticket by dividing the expected gate revenue by 16500 (assuming for 1000 ish seats to be comped)
+games$Avg_Price = games$pred / 17000
+
+#taking the average of each game by tier to determine what the average price of a ticket will be in each tier.
+#This can obviously be expanded on more with more data and thorough deliberation within different sectors of the business, but this is a reasonable direction to start in when getting a baseline for what prices will look like before the season starts and dynamic pricing plays a bigger role.
+games_prices <- games %>% group_by(tier_cluster) %>% mutate(Variable_Price = mean(Avg_Price)) %>% select(Game_Date, Home_Team, Opponent_Team_Abbreviation, tier_cluster, Variable_Price)
+
+write.csv(games_prices, "Tiers_and_Prices.csv", row.names = F)
+```
+
